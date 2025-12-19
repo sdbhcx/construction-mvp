@@ -1,0 +1,12 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+pillow>=10.0.0
+pydantic==2.5.0
+openai==0.28.0  # 或使用其他LLM API
+jinja2==3.1.2
+python-dotenv==1.0.0  # 管理环境变量
+sqlalchemy==2.0.23  # ORM框架
+psycopg2-binary==2.9.9  # PostgreSQL数据库适配器
+pytesseract==0.3.10  # OCR库
+PyPDF2==3.0.1  # PDF处理库

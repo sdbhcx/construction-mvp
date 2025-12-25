@@ -1,7 +1,6 @@
 from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, ForeignKey, DECIMAL
 from sqlalchemy.orm import relationship
-from datetime import datetime
-from backend.config.database import Base
+from app.db.base import Base
 
 
 class ProjectConstructionRecord(Base):

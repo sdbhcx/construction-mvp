@@ -8,17 +8,12 @@ class ProjectConstructionRecord(Base):
     """现场施工记录主表ORM模型"""
     __tablename__ = "project_construction_record"
     
-    tenant = Column(String(50), primary_key=True, comment="租户code")
     org_id = Column(Integer, primary_key=True, default=0, comment="组织ID、或项目id")
     id = Column(Integer, primary_key=True, comment="id")
     weather = Column(String(50), comment="天气")
     temperature = Column(String(50), comment="温度")
     record_time = Column(DateTime, nullable=False, comment="记录时间")
     commit_time = Column(DateTime, comment="提交时间")
-    number_of_comments = Column(Integer, nullable=False, default=0, comment="评论数")
-    number_of_readers = Column(Integer, nullable=False, default=0, comment="已读数")
-    status = Column(String(50), nullable=False, default="uncommitted", comment="状态，默认未提交")
-    source_type = Column(String(50), comment="记录来源")
     summarize = Column(String, comment="记录文字")
     creator = Column(Integer, nullable=False, default=0, comment="记录创建人，提交人")
     created_at = Column(DateTime, nullable=False, comment="记录创建时间，提交时间")
@@ -26,8 +21,6 @@ class ProjectConstructionRecord(Base):
     updated_at = Column(DateTime, nullable=False, comment="记录修改时间")
     is_removed = Column(Boolean, nullable=False, default=False, comment="删除标记")
     version = Column(Integer, nullable=False, comment="记录版本号")
-    project_construction_record_adjustment_id = Column(Integer, comment="调差单据id")
-    approval_status = Column(String(50), comment="单据审批状态")
     
     # 关系定义
     details = relationship("ProjectConstructionRecordDetail", back_populates="record")
@@ -39,7 +32,6 @@ class ProjectConstructionRecordDetail(Base):
     """现场施工记录详情表ORM模型"""
     __tablename__ = "project_construction_record_detail"
     
-    tenant = Column(String(50), primary_key=True, comment="租户code")
     org_id = Column(Integer, primary_key=True, default=0, comment="组织ID、或项目id")
     id = Column(Integer, primary_key=True, comment="id")
     project_construction_record_id = Column(Integer, nullable=False, comment="主表id")
@@ -72,7 +64,6 @@ class ProjectConstructionRecordProcedureDetail(Base):
     """施工记录工序记录字段历史详情表ORM模型"""
     __tablename__ = "project_construction_record_procedure_detail"
     
-    tenant = Column(String(50), primary_key=True, comment="租户code")
     org_id = Column(Integer, primary_key=True, default=0, comment="组织ID、或项目id")
     id = Column(Integer, primary_key=True, comment="id")
     project_construction_record_id = Column(Integer, nullable=False, comment="施工记录主表id")
@@ -108,7 +99,6 @@ class ProjectConstructionRecordProgressQuantity(Base):
     """现场施工记录形象量记录表ORM模型"""
     __tablename__ = "project_construction_record_progress_quantity"
     
-    tenant = Column(String(50), primary_key=True, comment="租户code")
     org_id = Column(Integer, primary_key=True, default=0, comment="组织ID、或项目id")
     id = Column(Integer, primary_key=True, comment="id")
     project_construction_record_id = Column(Integer, nullable=False, comment="记录id")

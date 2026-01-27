@@ -6,8 +6,14 @@ from typing import Dict, Any, Optional
 import base64
 import io
 from PIL import Image
+from paddleocr import PaddleOCR
 
 logger = logging.getLogger(__name__)
+
+# 初始化PaddleOCR实例（全局实例，避免重复初始化）
+# enable_mkldnn参数用于启用CPU加速
+# lang='ch'表示识别中文
+ocr = PaddleOCR(use_angle_cls=True, lang='ch', enable_mkldnn=True)
 
 
 async def run_ocr_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -28,31 +34,65 @@ async def run_ocr_node(state: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("文件路径不能为空")
     
     try:
-        # 模拟OCR识别结果
-        # 实际项目中，这里应该调用真实的OCR服务
+        # 调用真实的PaddleOCR服务
+        logger.info(f"使用PaddleOCR处理文件: {file_path}")
+        
+        # 执行OCR识别
+        # PaddleOCR.ocr()返回格式: [[[[bbox], (text, confidence)], ...]]
+        ocr_output = ocr.ocr(file_path, cls=True)
+        
+        logger.info(f"OCR识别完成，共识别到 {len(ocr_output)} 页")
+        
+        # 解析OCR结果
+        pages = len(ocr_output)
+        all_text = []
+        all_blocks = []
+        confidence_scores = []
+        
+        for page_num, page_content in enumerate(ocr_output):
+            page_text = []
+            
+            if not page_content:
+                continue
+            
+            for line_idx, line in enumerate(page_content):
+                # 提取文本和置信度
+                text = line[1][0]
+                confidence = line[1][1]
+                
+                # 提取边界框
+                bbox = line[0]
+                # 将边界框转换为 [x1, y1, x2, y2] 格式
+                x_coords = [point[0] for point in bbox]
+                y_coords = [point[1] for point in bbox]
+                bbox_formatted = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+                
+                # 添加到结果列表
+                page_text.append(text)
+                all_text.append(text)
+                confidence_scores.append(confidence)
+                
+                # 添加到区块列表
+                all_blocks.append({
+                    "text": text,
+                    "confidence": confidence,
+                    "bbox": bbox_formatted,
+                    "page": page_num + 1,
+                    "line": line_idx + 1
+                })
+            
+        # 计算平均置信度
+        avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+        
+        # 构建与原来格式兼容的结果
         ocr_results = {
-            "text": "2024年3月15日，B区工地完成混凝土浇筑，施工队伍：张三班组，工点：B区1号楼，分项工程：主体结构，部位：3层，工序：混凝土浇筑，完成量：100m³，天气：晴",
-            "confidence": 0.95,
-            "pages": 1,
+            "text": "，".join(all_text),
+            "confidence": avg_confidence,
+            "pages": pages,
             "layout": {
-                "blocks": [
-                    {
-                        "text": "2024年3月15日，B区工地完成混凝土浇筑，施工队伍：张三班组",
-                        "confidence": 0.96,
-                        "bbox": [0, 0, 500, 100]
-                    },
-                    {
-                        "text": "工点：B区1号楼，分项工程：主体结构，部位：3层",
-                        "confidence": 0.94,
-                        "bbox": [0, 100, 500, 200]
-                    },
-                    {
-                        "text": "工序：混凝土浇筑，完成量：100m³，天气：晴",
-                        "confidence": 0.95,
-                        "bbox": [0, 200, 500, 300]
-                    }
-                ]
-            }
+                "blocks": all_blocks
+            },
+            "raw_output": ocr_output  # 保存原始输出，便于调试
         }
         
         # 更新状态

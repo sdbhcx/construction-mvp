@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 # ner_nodes.py - 命名实体识别节点
 
+python
 import logging
-from typing import Dict, Any, List, Optional
-import re
+from typing import Dict, Any
+import torch
+from transformers import BertTokenizerFast, BertForTokenClassification
+from transformers import pipeline
 
 logger = logging.getLogger(__name__)
 
+# 全局NER管道，避免重复加载
+_ner_pipeline = None
+
+def get_ner_pipeline():
+    global _ner_pipeline
+    if _ner_pipeline is None:
+        # 可替换为更适合中文NER的模型，如"ckiplab/bert-base-chinese-ner"
+        model_name = "ckiplab/bert-base-chinese-ner"
+        _ner_pipeline = pipeline("ner", model=model_name, tokenizer=model_name, grouped_entities=True, device=0 if torch.cuda.is_available() else -1)
+    return _ner_pipeline
 
 async def run_ner_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """执行命名实体识别节点
-    
-    Args:
-        state: 处理状态
-        
-    Returns:
-        Dict[str, Any]: 更新后的状态
-    """
+    """执行命名实体识别节点，调用真实模型"""
     logger.info("执行命名实体识别节点")
-    
     text = state.get("extracted_text")
-    
     if not text:
         return {
             **state,
@@ -29,114 +33,18 @@ async def run_ner_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "confidence": 0.0
             }
         }
-    
-    # 模拟NER识别结果
-    # 实际项目中，这里应该调用真实的NER模型或服务
+    ner = get_ner_pipeline()
+    ner_outputs = ner(text)
     entities = []
-    
-    # 识别日期
-    date_pattern = r'\d{4}[-年]\d{1,2}[-月]\d{1,2}[日]?'
-    for match in re.finditer(date_pattern, text):
+    for ent in ner_outputs:
         entities.append({
-            "text": match.group(),
-            "type": "DATE",
-            "start": match.start(),
-            "end": match.end(),
-            "confidence": 0.99
+            "text": ent["word"],
+            "type": ent["entity_group"] if "entity_group" in ent else ent["entity"],
+            "start": ent["start"],
+            "end": ent["end"],
+            "confidence": float(ent.get("score", 1.0))
         })
-    
-    # 识别地点
-    location_pattern = r'[A-Za-z]*区\w+[工地|楼|号楼]'
-    for match in re.finditer(location_pattern, text):
-        entities.append({
-            "text": match.group(),
-            "type": "LOCATION",
-            "start": match.start(),
-            "end": match.end(),
-            "confidence": 0.95
-        })
-    
-    # 识别施工队伍
-    team_pattern = r'施工队伍[:：]?\s*([\u4e00-\u9fa5]+班组)'
-    for match in re.finditer(team_pattern, text):
-        entities.append({
-            "text": match.group(1),
-            "type": "TEAM",
-            "start": match.start(1),
-            "end": match.end(1),
-            "confidence": 0.96
-        })
-    
-    # 识别工点
-    workpoint_pattern = r'工点[:：]?\s*([\u4e00-\u9fa5\w]+)'
-    for match in re.finditer(workpoint_pattern, text):
-        entities.append({
-            "text": match.group(1),
-            "type": "WORKPOINT",
-            "start": match.start(1),
-            "end": match.end(1),
-            "confidence": 0.97
-        })
-    
-    # 识别分项工程
-    subproject_pattern = r'分项工程[:：]?\s*([\u4e00-\u9fa5]+)'
-    for match in re.finditer(subproject_pattern, text):
-        entities.append({
-            "text": match.group(1),
-            "type": "SUBPROJECT",
-            "start": match.start(1),
-            "end": match.end(1),
-            "confidence": 0.98
-        })
-    
-    # 识别部位
-    position_pattern = r'部位[:：]?\s*([\d层|地下室|屋面]+)'
-    for match in re.finditer(position_pattern, text):
-        entities.append({
-            "text": match.group(1),
-            "type": "POSITION",
-            "start": match.start(1),
-            "end": match.end(1),
-            "confidence": 0.99
-        })
-    
-    # 识别工序
-    process_pattern = r'工序[:：]?\s*([\u4e00-\u9fa5]+)'
-    for match in re.finditer(process_pattern, text):
-        entities.append({
-            "text": match.group(1),
-            "type": "PROCESS",
-            "start": match.start(1),
-            "end": match.end(1),
-            "confidence": 0.98
-        })
-    
-    # 识别完成量
-    quantity_pattern = r'完成量[:：]?\s*([\d.]+\s*[m³|t|㎡|m|kg]+)'
-    for match in re.finditer(quantity_pattern, text):
-        entities.append({
-            "text": match.group(1),
-            "type": "QUANTITY",
-            "start": match.start(1),
-            "end": match.end(1),
-            "confidence": 0.99
-        })
-    
-    # 识别天气
-    weather_pattern = r'天气[:：]?\s*([\u4e00-\u9fa5]+)'
-    for match in re.finditer(weather_pattern, text):
-        entities.append({
-            "text": match.group(1),
-            "type": "WEATHER",
-            "start": match.start(1),
-            "end": match.end(1),
-            "confidence": 0.95
-        })
-    
-    # 计算平均置信度
-    avg_confidence = sum(entity["confidence"] for entity in entities) / len(entities) if entities else 0.0
-    
-    # 更新状态
+    avg_confidence = sum(e["confidence"] for e in entities) / len(entities) if entities else 0.0
     return {
         **state,
         "ner_results": {

@@ -1,0 +1,87 @@
+# routing_config.yaml - 智能体路由规则配置
+
+# 文档路由规则
+document_routing:
+  # 默认路由规则
+  default:
+    task_type: extraction
+    queue: document_processing
+    priority: 8
+  
+  # 基于文件类型的路由规则
+  by_file_type:
+    image:
+      task_type: ocr_extraction
+      queue: ocr_processing
+      priority: 8
+    excel:
+      task_type: table_analysis
+      queue: table_processing
+      priority: 7
+    csv:
+      task_type: table_analysis
+      queue: table_processing
+      priority: 7
+    pdf:
+      task_type: extraction
+      queue: document_processing
+      priority: 8
+    word:
+      task_type: extraction
+      queue: document_processing
+      priority: 8
+    txt:
+      task_type: simple_extraction
+      queue: simple_processing
+      priority: 6
+  
+  # 基于用户意图的路由规则
+  by_user_intent:
+    store:
+      task_type: storage
+      queue: document_storage
+      priority: 5
+    compare:
+      task_type: comparison
+      queue: document_comparison
+      priority: 7
+    analyze:
+      task_type: analysis
+      queue: document_analysis
+      priority: 7
+  
+  # 基于文件大小的路由规则
+  by_file_size:
+    small:  # < 1MB
+      priority: 8
+    medium:  # 1MB - 10MB
+      priority: 7
+    large:  # > 10MB
+      priority: 6
+
+# 查询路由规则
+query_routing:
+  # 默认路由规则
+  default:
+    task_type: query
+    queue: query_processing
+    priority: 7
+  
+  # 基于查询意图的路由规则
+  by_intent:
+    question:
+      task_type: question
+      queue: question_processing
+      priority: 8
+    report:
+      task_type: report
+      queue: report_processing
+      priority: 7
+    statistics:
+      task_type: statistics
+      queue: statistics_processing
+      priority: 6
+    history:
+      task_type: history
+      queue: history_processing
+      priority: 5

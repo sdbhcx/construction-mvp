@@ -4,7 +4,7 @@ import traceback
 from datetime import date, datetime
 from functools import wraps
 
-from sanic import response
+from fastapi import response
 
 from common.exception import MyException
 from constants.code_enum import SysCodeEnum

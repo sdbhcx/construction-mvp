@@ -2,9 +2,13 @@
 # orchestrator.py - 智能体调度器
 
 import logging
+import json
+import yaml
+import os
 from datetime import datetime
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
+import redis
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +27,65 @@ class OrchestratorAgent:
     def __init__(self):
         """初始化智能体调度器"""
         logger.info("初始化智能体调度器")
-        # 初始化消息队列客户端（这里使用模拟实现，实际应替换为真实的消息队列客户端）
+        # 加载路由配置
+        self.routing_config = self._load_routing_config()
+        # 初始化消息队列客户端
         self.message_queue = self._init_message_queue()
+    
+    def _load_routing_config(self) -> Dict[str, Any]:
+        """加载路由配置文件"""
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "configs",
+            "routing_config.yaml"
+        )
+        
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+            logger.info(f"成功加载路由配置: {config_path}")
+            return config
+        except Exception as e:
+            logger.error(f"加载路由配置失败: {e}")
+            # 返回默认配置
+            return {
+                "document_routing": {
+                    "default": {
+                        "task_type": "extraction",
+                        "queue": "document_processing",
+                        "priority": 8
+                    }
+                },
+                "query_routing": {
+                    "default": {
+                        "task_type": "query",
+                        "queue": "query_processing",
+                        "priority": 7
+                    }
+                }
+            }
     
     def _init_message_queue(self):
         """初始化消息队列客户端"""
-        # 这里使用模拟实现，实际应替换为RabbitMQ、Kafka等消息队列客户端
-        logger.info("初始化消息队列客户端（模拟实现）")
-        return MockMessageQueue()
+        # 使用Redis作为真实的消息队列客户端
+        logger.info("初始化Redis消息队列客户端")
+        try:
+            # 创建Redis连接
+            redis_client = redis.Redis(
+                host='localhost',
+                port=6379,
+                db=0,
+                decode_responses=True
+            )
+            # 测试连接
+            redis_client.ping()
+            logger.info("Redis连接成功")
+            return RedisMessageQueue(redis_client)
+        except Exception as e:
+            logger.error(f"Redis连接失败: {e}")
+            logger.warning("由于Redis服务未启动，将使用模拟消息队列进行开发测试")
+            # 在开发环境中回退到模拟消息队列
+            return MockMessageQueue()
     
     def route_document(self, document: Dict[str, Any]) -> Task:
         """路由文档处理请求
@@ -49,22 +104,63 @@ class OrchestratorAgent:
                 logger.error("文档验证失败")
                 raise ValueError("文档验证失败")
             
+            # 获取文档属性
+            file_type = document.get('file_type', 'unknown').lower()
+            user_intent = document.get('user_intent', 'extract').lower()
+            file_size = document.get('file_size', 0)
+            
+            # 获取默认路由配置
+            doc_config = self.routing_config.get('document_routing', {})
+            default_config = doc_config.get('default', {
+                'task_type': 'extraction',
+                'queue': 'document_processing',
+                'priority': 8
+            })
+            
+            # 基于文件类型的路由
+            file_type_config = doc_config.get('by_file_type', {}).get(file_type, {})
+            
+            # 基于用户意图的路由
+            intent_config = doc_config.get('by_user_intent', {}).get(user_intent, {})
+            
+            # 合并配置（优先级：意图 > 文件类型 > 默认）
+            routing_config = {
+                **default_config,
+                **file_type_config,
+                **intent_config
+            }
+            
+            # 基于文件大小调整优先级
+            size_config = doc_config.get('by_file_size', {})
+            if file_size > 0:
+                if file_size > 10 * 1024 * 1024:  # > 10MB
+                    size_priority = size_config.get('large', {}).get('priority')
+                elif file_size > 1 * 1024 * 1024:  # 1MB - 10MB
+                    size_priority = size_config.get('medium', {}).get('priority')
+                else:  # < 1MB
+                    size_priority = size_config.get('small', {}).get('priority')
+                
+                if size_priority is not None:
+                    routing_config['priority'] = size_priority
+            
             # 创建文档处理任务
             task = Task(
-                type='extraction',
-                priority=8,  # 文档处理优先级较高
+                type=routing_config['task_type'],
+                priority=routing_config['priority'],
                 payload=document,
                 metadata={
                     'timestamp': datetime.now().isoformat(),
-                    'task_type': 'document_processing',
-                    'file_type': document.get('file_type', 'unknown')
+                    'task_type': routing_config['task_type'],
+                    'file_type': file_type,
+                    'user_intent': user_intent,
+                    'file_size': file_size
                 }
             )
             
             # 发布任务到消息队列
-            self.publish_task(task, queue='document_processing')
+            self.publish_task(task, queue=routing_config['queue'])
             
-            logger.info(f"成功路由文档处理请求到信息抽取智能体")
+            logger.info(f"成功路由文档处理请求到队列: {routing_config['queue']}")
             return task
             
         except Exception as e:
@@ -88,22 +184,43 @@ class OrchestratorAgent:
                 logger.error("查询验证失败")
                 raise ValueError("查询验证失败")
             
+            # 获取查询属性
+            query_intent = query.get('intent', 'question').lower()
+            
+            # 获取默认路由配置
+            query_config = self.routing_config.get('query_routing', {})
+            default_config = query_config.get('default', {
+                'task_type': 'query',
+                'queue': 'query_processing',
+                'priority': 7
+            })
+            
+            # 基于查询意图的路由
+            intent_config = query_config.get('by_intent', {}).get(query_intent, {})
+            
+            # 合并配置（优先级：意图 > 默认）
+            routing_config = {
+                **default_config,
+                **intent_config
+            }
+            
             # 创建查询处理任务
             task = Task(
-                type='query',
-                priority=7,  # 查询优先级较高
+                type=routing_config['task_type'],
+                priority=routing_config['priority'],
                 payload=query,
                 metadata={
                     'timestamp': datetime.now().isoformat(),
-                    'task_type': 'query_processing',
-                    'user_id': query.get('user_id')
+                    'task_type': routing_config['task_type'],
+                    'user_id': query.get('user_id'),
+                    'intent': query_intent
                 }
             )
             
             # 发布任务到消息队列
-            self.publish_task(task, queue='query_processing')
+            self.publish_task(task, queue=routing_config['queue'])
             
-            logger.info(f"成功路由查询请求到问答与查询智能体")
+            logger.info(f"成功路由查询请求到队列: {routing_config['queue']}")
             return task
             
         except Exception as e:
@@ -166,8 +283,56 @@ class OrchestratorAgent:
         logger.info("停止智能体调度器")
 
 
+class RedisMessageQueue:
+    """Redis消息队列客户端"""
+    
+    def __init__(self, redis_client: redis.Redis):
+        self.redis_client = redis_client
+    
+    def publish(self, queue: str, message: Dict[str, Any]):
+        """发布消息到队列
+        
+        Args:
+            queue: 队列名称
+            message: 消息内容
+        """
+        try:
+            # 将消息转换为JSON字符串
+            message_json = json.dumps(message)
+            # 使用Redis的LPUSH命令将消息添加到队列
+            result = self.redis_client.lpush(queue, message_json)
+            logger.info(f"Redis消息队列: 发布消息到 {queue}，队列长度: {result}")
+        except Exception as e:
+            logger.error(f"Redis消息队列发布失败: {e}")
+            raise
+    
+    def consume(self, queue: str, block: int = 0) -> Optional[Dict[str, Any]]:
+        """从队列消费消息
+        
+        Args:
+            queue: 队列名称
+            block: 阻塞时间（秒），0表示无限阻塞
+            
+        Returns:
+            Optional[Dict[str, Any]]: 消息内容或None
+        """
+        try:
+            # 使用Redis的BRPOP命令从队列右侧阻塞式获取消息
+            result = self.redis_client.brpop(queue, timeout=block)
+            if result:
+                queue_name, message_json = result
+                # 将JSON字符串转换为字典
+                message = json.loads(message_json)
+                logger.info(f"Redis消息队列: 从 {queue_name} 消费消息")
+                return message
+            return None
+        except Exception as e:
+            logger.error(f"Redis消息队列消费失败: {e}")
+            raise
+
+
 class MockMessageQueue:
-    """模拟消息队列客户端"""
+    """模拟消息队列客户端（开发环境回退使用）"""
     
     def __init__(self):
         self.queues = {}
@@ -184,11 +349,12 @@ class MockMessageQueue:
         self.queues[queue].append(message)
         logger.info(f"模拟消息队列: 发布消息到 {queue}，队列长度: {len(self.queues[queue])}")
     
-    def consume(self, queue: str) -> Optional[Dict[str, Any]]:
+    def consume(self, queue: str, block: int = 0) -> Optional[Dict[str, Any]]:
         """从队列消费消息
         
         Args:
             queue: 队列名称
+            block: 阻塞时间（秒），0表示无限阻塞（模拟实现中忽略）
             
         Returns:
             Optional[Dict[str, Any]]: 消息内容或None

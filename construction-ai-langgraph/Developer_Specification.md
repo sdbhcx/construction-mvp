@@ -77,13 +77,121 @@ src/
 └── schemas/            # 数据协议 (Pydantic Models)
 ```
 
-### 4.2 关键交互流程
+### 4.2 关键交互流程与 LangGraph 编排设计
 
-1.  **感知 (Input)**: 如果是复杂 PDF，先通过 Layout Analysis 拆解。
-2.  **记忆 (Recall)**: Planner 根据任务目标，从 Memory Store 检索“相似文档的处理经验”。
-3.  **规划 (Plan)**: 生成初步步骤，例如 `[OCR -> 表格提取 -> 规则校验]`。
-4.  **行动 (Act)**: Executor 依次调用工具。每次调用前，Policy Engine 检查预算。
-5.  **反思 (Critique)**: Critic 检查提取结果。如果置信度低，指示 Planner 插入“人工复核”或“切换模型”步骤。
+在多智能体架构中，关于“智能体是否作为 LangGraph 的 Node”，系统支持两种视角的理解与实现。本项目核心采用 **“智能体即节点 (Agent-as-a-Node)”** 的 LangGraph 原生编排模式，但也兼容底层的 **“事件驱动 (Event-Driven)”** 异步交互。
+
+#### 模式一：基于 LangGraph 的图节点交互（核心架构）
+在这种模式下，每个 Agent（如 Planner, Executor, Critic）都被封装为 LangGraph 中的一个 `Node`。全局共享一个 `TaskState`（状态字典），通过图的 `Edge`（边）和 `Conditional Edge`（条件路由）实现状态流转。
+
+**LangGraph 流程图**:
+
+```mermaid
+graph TD
+    %% 定义样式
+    classDef start_end fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef agent fill:#d4edda,stroke:#333,stroke-width:2px;
+    classDef tool fill:#cce5ff,stroke:#333,stroke-width:1px,stroke-dasharray: 5 5;
+    classDef condition fill:#fff3cd,stroke:#333,stroke-width:2px,shape:diamond;
+    classDef human fill:#f8d7da,stroke:#333,stroke-width:2px;
+
+    %% 节点定义
+    START((START)):::start_end
+    END((END)):::start_end
+    
+    Coordinator[Coordinator Node<br/>意图识别与路由]:::agent
+    Planner[Planner Node<br/>任务拆解与规划]:::agent
+    Executor[Executor Node<br/>工具调度执行]:::agent
+    Critic[Critic Node<br/>结果反思与评估]:::agent
+    Writer[Writer Node<br/>报告生成与排版]:::agent
+    
+    HumanReview[Human Review Node<br/>人工复核]:::human
+    
+    %% 工具节点 (作为Executor的子调用)
+    subgraph Tools [底层工具调用]
+        OCR[OCR Tool]:::tool
+        VLM[VLM Tool]:::tool
+        SQL[SQL Tool]:::tool
+        Vector[Vector Search]:::tool
+    end
+
+    %% 路由条件节点
+    RouteIntent{意图是什么?}:::condition
+    CheckQuality{置信度>0.8?}:::condition
+    CheckRecoverable{错误可恢复?}:::condition
+    CheckRetry{重试次数<3?}:::condition
+    CheckReport{需要生成报告?}:::condition
+
+    %% 连线与流程
+    START --> Coordinator
+    
+    Coordinator --> RouteIntent
+    
+    %% 路由分支
+    RouteIntent -- "Extraction/QA/Report" --> Planner
+    RouteIntent -- "Command (系统指令)" --> END
+    
+    %% 核心 ReAct 循环
+    Planner -- "生成执行计划" --> Executor
+    
+    Executor -. "调用" .-> Tools
+    Tools -. "返回结果" .-> Executor
+    
+    Executor -- "更新中间状态" --> Critic
+    
+    Critic --> CheckQuality
+    
+    %% 评估分支
+    CheckQuality -- "Yes (合格)" --> CheckReport
+    CheckQuality -- "No (不合格)" --> CheckRecoverable
+    
+    CheckRecoverable -- "Yes (可恢复)" --> CheckRetry
+    CheckRecoverable -- "No (不可恢复)" --> HumanReview
+    
+    CheckRetry -- "Yes (继续重试)" --> Planner
+    CheckRetry -- "No (达到上限)" --> HumanReview
+    
+    %% 报告分支
+    CheckReport -- "Yes" --> Writer
+    CheckReport -- "No" --> END
+    
+    %% 结束分支
+    Writer --> END
+    HumanReview --> END
+```
+
+**详细交互流程**：
+1. **入口路由 (Coordinator Node)**: 
+   - 用户请求进入图的起点 `Coordinator`。
+   - `Coordinator` 更新 `TaskState`，进行权限和预算校验，并根据意图决定下一步的路由。如果意图是系统指令则直接结束，如果是业务任务则路由到 `Planner Node`。
+2. **规划阶段 (Planner Node)**:
+   - 接收 `TaskState`，从 Memory Store 检索相似经验（Few-shot）。
+   - 生成具体的执行步骤（如 `[OCR -> NER -> VLM]`），写入 `TaskState["plan"]`。
+3. **执行阶段 (Executor Node)**:
+   - 读取 `TaskState["plan"]`，依次调度底层 Tool（如调用 PaddleOCR）。
+   - 将工具的原始输出写入 `TaskState["intermediate_results"]`。
+4. **反思与评估 (Critic Node)**:
+   - 检查 `intermediate_results` 的完整性和逻辑一致性。
+   - **条件路由 (Conditional Edge)**:
+     - 如果置信度高（>0.8）：检查任务类型，如果是报表任务则路由到 `Writer Node`，否则直接结束（`END`）。
+     - 如果置信度低（<0.8）：首先进行**快速失败 (Fast Fail)** 判断。如果检测到不可恢复的致命错误（如源文件损坏、图片全黑），直接跳出循环，路由到 `Human_Review_Node`。
+     - 如果错误可恢复且重试次数未达上限：生成反馈意见写入 `TaskState["feedback"]`，路由回 `Planner Node` 重新规划（形成 ReAct 循环）。
+     - 如果多次重试失败：路由到 `Human_Review_Node`（人工复核）。
+5. **报告生成 (Writer Node)**:
+   - 仅在任务类型为“报表生成 (Report)”且数据校验合格时触发。
+   - 接收结构化数据，调用模板引擎或绘图工具，生成最终的文档（PDF/Markdown），随后结束（`END`）。
+
+#### 模式二：非图节点交互模式（事件驱动/微服务解耦）
+如果未来系统扩展，某些重型 Agent（如需要长时间 GPU 排队的 VLM Agent）不适合作为同步的图节点阻塞 LangGraph 的执行，系统将采用**基于消息队列（Redis/Celery）的异步交互流程**。此时，Agent 不再是 LangGraph 的 Node，而是独立的服务。
+
+**详细交互流程**：
+1. **任务分发**: `Coordinator` 接收请求后，生成一个全局 `Task_ID`，并将任务事件推送到消息队列（如 `extraction_queue`），随后立即向用户返回 `Task_ID`（非阻塞）。
+2. **独立订阅**: `Planner Agent` 作为独立微服务订阅队列，获取任务后生成计划，并将计划事件推送到 `execution_queue`。
+3. **异步执行**: `Executor Agent` 消费执行事件，调用耗时的 GPU 模型（如 Qwen-VL）。执行完毕后，将结果写入 Redis/PostgreSQL，并发布 `evaluation_queue` 事件。
+4. **回调与反思**: `Critic Agent` 消费评估事件，如果发现错误，它不通过图的边返回，而是重新发布一个带有 `feedback` 的事件到 `planning_queue`。
+5. **状态聚合**: 前端通过 WebSocket 或轮询 API，根据 `Task_ID` 从 Redis 中实时获取各个独立 Agent 更新的进度状态。
+
+**总结**：本项目当前在 `construction-ai-langgraph` 模块中采用**模式一（Agent即Node）**，以利用 LangGraph 强大的状态管理和可视化调试能力；而在 `backend` 的长耗时任务处理中，结合了**模式二**的思想，通过 Celery 进行外层异步包装。
 
 ### 4.3 智能体角色详解
 
@@ -91,14 +199,9 @@ src/
 **职责**: 类似于交响乐团的指挥或公司的项目经理。它不直接干活（不跑 OCR，不写 SQL），而是负责**接待、分诊、风控和兜底**。
 
 **核心功能**:
-1.  **意图识别与路由**: 基于用户指令和输入类型，将任务分发至不同流水线：
-    *   **Extraction Routing (单据提取)**: 处理上传的图片/PDF，目标是结构化入库。
-    *   **QA Routing (智能问答)**: 处理自然语言提问（如“查询某工地隐患”），目标是检索并生成答案。
-    *   **Report Routing (报表生成)**: 处理复杂聚合请求（如“生成本月安全隐患周报”）。Coordinator 会启动一个并行工作流：
-        *   调用 `SQLTool` 统计隐患数量与类型分布。
-        *   调用 `VectorSearchTool` 检索典型隐患照片。
-        *   最后由 `Writer Agent` 汇总生成图文并茂的 PDF/Markdown 报告。
-    *   **Command Routing (系统指令)**: 处理运维与配置类指令（如“将阈值调整为0.8”或“清除OCR缓存”）。Coordinator 会进行严格的**权限校验**，直接调用 `SystemTool` 或 `AdminAPI` 执行操作，并记录审计日志。
+1.  **意图识别与路由**: 基于用户指令和输入类型，决定任务的流转方向：
+    *   **业务任务 (Extraction/QA/Report)**: 处理上传的图片/PDF（目标是结构化入库）、处理自然语言提问（目标是检索并生成答案）、处理复杂聚合请求（如生成报表）。Coordinator 会将这些任务统一路由给 `Planner Agent` 进行详细规划。
+    *   **系统指令 (Command)**: 处理运维与配置类指令（如“将阈值调整为0.8”或“清除OCR缓存”）。Coordinator 会进行严格的**权限校验**，直接调用 `SystemTool` 或 `AdminAPI` 执行操作，并记录审计日志，随后直接结束流程。
 2.  **资源与权限门禁**: 检查用户是否有权操作该项目，项目余额是否由足，预估任务复杂度。
 3.  **异常熔断与降级**: 当子 Agent（如 Planner）陷入死循环或耗时过长时，强制介入终止，并返回友好的降级回复。
 4.  **人机交互管理**: 决定何时打断流程请求人工确认（Human-in-the-loop）。
@@ -119,7 +222,32 @@ src/
 5.  **监控 (Monitor)**:
     *   如果 `Planner` 反馈图片太模糊无法处理，`Coordinator` 不会直接崩溃，而是请求用户：“图片清晰度不足，请重新上传或手动输入关键信息”。
 
-#### 4.3.2 Writer Agent (文书智能体)
+#### 4.3.2 Planner Agent (规划智能体)
+**职责**: 负责将复杂任务拆解为可执行的步骤（DAG 或线性计划），并根据上下文动态调整策略。它是系统的“大脑”和“战术制定者”。
+
+**核心功能**:
+1.  **任务拆解 (Task Decomposition)**: 将 Coordinator 分配的宏观任务（如“提取这份模糊表格中的隐患项”）拆解为具体的工具调用序列（如 `[ImageEnhancement -> TableOCR -> LLM_Extraction]`）。
+2.  **经验检索 (Experience Recall)**: 在制定计划前，从长期记忆库（Memory Store）中检索类似文档的处理经验（Few-shot examples），以提高计划的成功率。
+3.  **动态调整 (Dynamic Replanning)**: 当 Executor 执行失败或 Critic 认为结果不达标时，Planner 会接收反馈并重新生成备用计划（例如，OCR 失败则尝试调用 VLM）。
+
+#### 4.3.3 Executor Agent (执行智能体)
+**职责**: 负责具体执行 Planner 制定的计划步骤，调度底层工具，并处理执行过程中的异常。它是系统的“手”和“实干家”。
+
+**核心功能**:
+1.  **工具调度 (Tool Invocation)**: 根据计划步骤，准确调用对应的工具（如 `OCRTool`, `SQLTool`, `VectorSearchTool`），并传递正确的参数。
+2.  **异常处理与重试 (Error Handling & Retry)**: 捕获工具执行过程中的异常（如网络超时、API 报错），进行有限次数的重试或降级处理。
+3.  **状态更新 (State Update)**: 将每一步的执行结果（成功、失败、中间数据）更新到全局状态（TaskState）中，供其他 Agent 读取。
+
+#### 4.3.4 Critic Agent (反思/评估智能体)
+**职责**: 负责对 Executor 的输出结果进行质量把控和逻辑校验。它是系统的“质检员”和“纠错者”。
+
+**核心功能**:
+1.  **结果校验 (Result Validation)**: 检查提取的数据是否符合预期的 Schema（如日期格式、必填项），校验逻辑一致性（如“整改期限”不能早于“检查日期”）。
+2.  **置信度评估 (Confidence Scoring)**: 结合 OCR 的置信度和 LLM 的自我评估，对最终结果打分。
+3.  **快速失败判断 (Fast Fail)**: 评估“错误的可恢复性”。如果检测到不可恢复的致命错误（如源文件损坏、图片全黑、文件格式不支持等），直接跳出重试循环，将状态标记为失败，并交由使用人决定后续操作，避免浪费计算资源。
+4.  **反馈生成 (Feedback Generation)**: 如果结果不达标且错误可恢复，生成具体的修改建议（如“第2行隐患描述提取不完整，请重新识别该区域”），并将其反馈给 Planner 触发重试；如果多次失败，则标记为需要“人工复核”。
+
+#### 4.3.5 Writer Agent (文书智能体)
 **职责**: 专注于“输出表达”。将结构化数据、图片和分析结论转化为人类可读的高质量文档（如周报 HTML、PDF 或 Markdown 摘要）。
 
 **核心功能**:
@@ -184,13 +312,32 @@ src/
 | T4-02 | **性能压测** | To Do | 2026-03-28 | 优化并发吞吐量 |
 | T4-03 | **UI 对接** | To Do | 2026-03-31 | 前端展示 Trace 和中间状态 |
 
+### 阶段五：可观测性集成 (Week 7)
+*目标：集成 Langfuse、Jaeger、Prometheus 等追踪工具，完成整体监控方案。*
+
+| 任务编号 | 任务名称 | 状态 | 完成日期 | 备注 |
+| :--- | :--- | :--- | :--- | :--- |
+| T5-01 | **Langfuse 集成** | To Do | 2026-04-01 | LLM 调用追踪 |
+| T5-02 | **OpenTelemetry 集成** | To Do | 2026-04-03 | 分布式链路追踪 |
+| T5-03 | **Prometheus 指标收集** | To Do | 2026-04-05 | 系统级别监控 |
+| T5-04 | **Grafana Dashboard** | To Do | 2026-04-08 | 可视化仪表板 |
+
 ## 7. 可扩展性与未来展望
 
 ### 7.1 可扩展性设计
-*   **工具热插拔**: 新增工具（如“工程图纸CAD解析”）不仅需要编写代码，只需在 `ToolRegistry` 并更新 `tools_description`，Planner 即可感知并使用。
+*   **工具热插拔**: 新增工具（如"工程图纸CAD解析"）不仅需要编写代码，只需在 `ToolRegistry` 并更新 `tools_description`，Planner 即可感知并使用。
 *   **多模型路由**: 支持通过配置切换底层 LLM（如从 Qwen-72B 切换到 GPT-4o），以适应不同成本/精度需求的任务。
 
 ### 7.2 未来规划
-*   **多智能体协作 (MARL)**: 引入“专家会诊”模式，让结构工程师Agent、预算员Agent共同审核一份复杂文档。
+*   **多智能体协作 (MARL)**: 引入"专家会诊"模式，让结构工程师Agent、预算员Agent共同审核一份复杂文档。
 *   **端侧轻量化**: 将 OCR 和轻量级 VLM 蒸馏后部署在边缘设备（如施工现场的手持终端），实现离线初步识别。
-*   **主动学习 (Active Learning)**: 将人工修正后的数据自动加入训练集，定期微调 LoRA 模型，实现“越用越懂业务”。
+*   **主动学习 (Active Learning)**: 将人工修正后的数据自动加入训练集，定期微调 LoRA 模型，实现"越用越懂业务"。
+
+## 8. 可观测性与追踪 (Observability & Tracing)
+
+详见 [OBSERVABILITY.md](./OBSERVABILITY.md) 文档，包含：
+- **追踪工具选型**：Langfuse、Langsmith、OpenTelemetry 等
+- **追踪指标体系**：LLM 调用、工具调用、Agent 执行、端到端请求的完整追踪
+- **集成实现方案**：代码示例和配置指南
+- **可视化与分析**：Langfuse Dashboard、Jaeger UI、Grafana 仪表板
+- **应用场景**：成本优化、性能优化、质量监控、故障诊断
